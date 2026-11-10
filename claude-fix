@@ -22,7 +22,7 @@ MARKER_FILE="Contents/Resources/claude-fix-generated"
 LAUNCH_SCRIPT_REL="Contents/Resources/claude-fix.sh"
 # v7: shared runtime helper, reopen via Apple event, signed bundles, profile picker that
 # also runs follow-up work, Claude-style icons, self-upgrade, optional own-app copies
-LAUNCHER_VERSION=10
+LAUNCHER_VERSION=11
 ICON_COUNT=8
 # Badge symbols and colors for `icon`; these match icons/glyphs.json.
 SYMBOL_NAMES="work personal home code star heart book globe bolt leaf moon chat"

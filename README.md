@@ -486,8 +486,13 @@ Symbols: `work`, `personal`, `home`, `code`, `star`, `heart`, `book`, `globe`, `
 image into Terminal there. Choices are saved in `~/.claude-fix/custom-icons` and
 survive `upgrade` and start fresh.
 
+Icons are always drawn from Claude's Default (light) artwork, whichever icon style
+the Dock is set to, and placed on the standard macOS icon grid so they match the size
+of other Dock icons. The badge sits inside the icon's outline.
+
 On macOS 26, icons built with Xcode 26 installed come with their own Dark, Clear and
-Tinted looks, because the recolored artwork and badge are compiled as a layered icon.
+Tinted looks, because the recolored artwork and badge are compiled as a layered icon
+(a solid fill in the profile color, with Claude's mark and a cut-out badge on top).
 Without Xcode, macOS applies its automatic treatment for those styles.
 
 Drawing Claude-style icons needs the Command Line Tools (`xcode-select --install`); the
@@ -803,6 +808,8 @@ To regenerate the flat fallback icons after changing `icons/glyphs.json`, run
   none) and the color (19 named or any hex), or use an image or Claude's icon
 - With Xcode 26, icons are compiled as layered icons with native Dark, Clear and
   Tinted styles on macOS 26
+- Icons no longer bake in the Dock's Dark style when drawn while it is on, and are
+  drawn at full size on the macOS icon grid with the badge inside the outline
 - Launchers get their own bundle ID, are re-signed after editing, and are
   registered with Launch Services, so icon changes show up
 - Desktop shortcuts are symlinks, and `clean` removes them
@@ -815,7 +822,7 @@ To regenerate the flat fallback icons after changing `icons/glyphs.json`, run
   fresh). Renamed profiles keep their sign-in, icon, Dock pin and Desktop shortcut
 - Running `claude-fix` updates launchers from older versions automatically, and
   launchers update themselves in the background after claude-fix is updated
-- Launcher version 6
+- Launcher version 11
 
 ---
 

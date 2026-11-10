@@ -424,7 +424,7 @@ test_launcher_applescript_payload() {
   assert_contains "$decompiled" "launch" "AppleScript asks the helper to launch"
   assert_contains "$(cat "$app/Contents/Resources/focus.js")" "rapp" "focus sends a reopen event"
   marker="$(cat "$app/Contents/Resources/claude-fix-generated")"
-  assert_contains "$marker" "launcher-version=10" "marker records launcher version"
+  assert_contains "$marker" "launcher-version=11" "marker records launcher version"
   assert_contains "$marker" "data-dir=ClaudeWork" "marker records data dir"
   assert_contains "$marker" "claude-app=$CLAUDE_LAUNCHERS_CLAUDE_APP" "marker records Claude path"
   assert_contains "$marker" "kind=launcher" "marker records kind"
@@ -1134,7 +1134,7 @@ test_upgrade_rebuilds_outdated_launchers() {
   assert_contains "$out" "Upgrading 2 launcher(s)" "reports upgrade"
   assert_file_exists "$HOME/Applications/Claude Work.app/Contents/Resources/claude-fix.sh" "Work has runtime helper"
   assert_contains "$(cat "$HOME/Applications/Claude Work.app/Contents/Resources/claude-fix-generated")" \
-    "launcher-version=10" "Work marker upgraded"
+    "launcher-version=11" "Work marker upgraded"
   assert_file_exists "$HOME/Applications/Claude Personal.app/Contents/Resources/claude-fix.sh" "Personal has runtime helper"
   assert_file_exists "$HOME/Applications/Claude Profiles.app/Contents/Resources/claude-fix.sh" "upgrade adds the picker"
   teardown_sandbox
@@ -1157,7 +1157,7 @@ test_outdated_launchers_prompt_upgrade() {
   assert_contains "$out" "Updating 2 launcher(s) from an older version" "migrates without asking"
   assert_contains "$out" "Claude Profile Switcher is already set up" "then shows the menu"
   assert_contains "$(cat "$HOME/Applications/Claude Work.app/Contents/Resources/claude-fix-generated")" \
-    "launcher-version=10" "Work is current"
+    "launcher-version=11" "Work is current"
   assert_file_exists "$HOME/Applications/Claude Profiles.app/Contents/Resources/claude-fix.sh" "picker added"
   assert_file_exists "$HOME/ClaudeWork/Cookies" "sign-in kept"
   assert_true "old Desktop copy became a shortcut" test -L "$HOME/Desktop/Claude Work.app"
@@ -1739,7 +1739,7 @@ test_background_upgrade_is_quiet_and_locked() {
   rmdir "$HOME/.claude-fix/upgrade.lock"
   capture_script upgrade --background >/dev/null
   assert_contains "$(cat "$HOME/Applications/Claude Work.app/Contents/Resources/claude-fix-generated")" \
-    "launcher-version=10" "migrated"
+    "launcher-version=11" "migrated"
   assert_file_missing "$HOME/.claude-fix/upgrade.lock" "lock released"
   teardown_sandbox
 }

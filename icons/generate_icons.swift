@@ -7,9 +7,11 @@
 //   generate_icons --app /Applications/Claude.app --output applet.icns
 //       [--symbol NAME | --letter L | --no-badge] [--color NAME | #RRGGBB]
 //       [--assets-car Assets.car] [--symbols glyphs.json]
-//       Recolor the app's own icon and add a badge. Because the icon is read from the
-//       installed app, launchers follow Claude's icon when it changes. With --assets-car
-//       and Xcode 26's actool available, also build a layered icon so macOS can draw its
+//       Recolor the app's own icon (its Default style, whatever style the Dock is set to)
+//       and add a badge. Because the icon is read from the installed app, launchers follow
+//       Claude's icon when it changes. The result is redrawn on the standard macOS icon grid
+//       and outline, so it sits at the same size as other Dock icons. With --assets-car and
+//       Xcode 26's actool available, also build a layered icon so macOS can draw its
 //       Default, Dark, Clear and Tinted styles.
 //
 //   generate_icons --index N --letter L --output out.icns
@@ -149,10 +151,18 @@ func symbolPath(_ parts: [Part], map: (CGFloat, CGFloat) -> NSPoint, scale: CGFl
     return path
 }
 
-func drawSymbol(_ symbol: Symbol, map: (CGFloat, CGFloat) -> NSPoint, scale: CGFloat, ink: NSColor, background: NSColor) {
+/// Draws a symbol. With `knockout`, the ink erases what is underneath instead of painting,
+/// so a badge disc shows the icon's own fill through its glyph.
+func drawSymbol(_ symbol: Symbol, map: (CGFloat, CGFloat) -> NSPoint, scale: CGFloat, ink: NSColor, background: NSColor,
+                knockout: Bool = false) {
     for shape in symbol.shapes {
         let path = symbolPath(shape.parts, map: map, scale: scale)
-        let color = shape.background == true ? background : ink.withAlphaComponent(CGFloat(shape.alpha ?? 1))
+        let isBackground = shape.background == true
+        let color = isBackground ? background : ink.withAlphaComponent(CGFloat(shape.alpha ?? 1))
+        NSGraphicsContext.saveGraphicsState()
+        if knockout && !isBackground {
+            NSGraphicsContext.current?.cgContext.setBlendMode(.destinationOut)
+        }
         if let width = shape.stroke {
             path.lineWidth = max(1, CGFloat(width) * scale)
             path.lineCapStyle = .round
@@ -164,6 +174,7 @@ func drawSymbol(_ symbol: Symbol, map: (CGFloat, CGFloat) -> NSPoint, scale: CGF
             color.setFill()
             path.fill()
         }
+        NSGraphicsContext.restoreGraphicsState()
     }
 }
 
@@ -240,15 +251,42 @@ func writeIcns(to output: URL, draw: (CGFloat) -> Void) {
     }
 }
 
+// MARK: - Icon shape
+
+/// macOS icon grid: the icon body is 824pt on a 1024pt canvas, centered. Icons drawn to this
+/// grid and shape sit at the same size as other apps in the Dock, and macOS 26 accepts them
+/// as-is instead of shrinking them onto a gray plate.
+let gridInset: CGFloat = 100.0 / 1024.0
+
+func iconBody(_ dim: CGFloat) -> NSRect {
+    let inset = dim * gridInset
+    return NSRect(x: inset, y: inset, width: dim - inset * 2, height: dim - inset * 2)
+}
+
+/// The rounded-square outline macOS uses for app icons, as a superellipse.
+func squircle(_ rect: NSRect) -> NSBezierPath {
+    let path = NSBezierPath()
+    let a = Double(rect.width / 2), b = Double(rect.height / 2), n = 5.0
+    let steps = 360
+    for i in 0..<steps {
+        let t = 2 * Double.pi * Double(i) / Double(steps)
+        let c = cos(t), s = sin(t)
+        let point = NSPoint(x: rect.midX + CGFloat(a * copysign(pow(abs(c), 2 / n), c)),
+                            y: rect.midY + CGFloat(b * copysign(pow(abs(s), 2 / n), s)))
+        if i == 0 { path.move(to: point) } else { path.line(to: point) }
+    }
+    path.close()
+    return path
+}
+
 // MARK: - Flat icons (fallback when an app icon can't be recolored)
 
 func drawFlat(dim: CGFloat, color: RGB, symbol: Symbol?, letter: String?) {
-    let inset = dim * 0.08
-    let rect = NSRect(x: inset, y: inset, width: dim - inset * 2, height: dim - inset * 2)
+    let rect = iconBody(dim)
     color.color.setFill()
-    NSBezierPath(roundedRect: rect, xRadius: dim * 0.22, yRadius: dim * 0.22).fill()
+    squircle(rect).fill()
 
-    let inner = rect.insetBy(dx: dim * 0.14, dy: dim * 0.14)
+    let inner = rect.insetBy(dx: rect.width * 0.167, dy: rect.width * 0.167)
     let ring = NSBezierPath(roundedRect: inner, xRadius: inner.width * 0.18, yRadius: inner.width * 0.18)
     ring.lineWidth = max(1, dim * 0.045)
     NSColor(white: 1, alpha: 0.92).setStroke()
@@ -390,12 +428,13 @@ func recolor(_ px: Pixels, to target: RGB) -> [Double] {
     return weights
 }
 
-/// Bounds of the visible icon, in points with the origin at the bottom left.
-func opaqueBounds(_ px: Pixels) -> NSRect {
+/// Bounds of the visible icon, in points with the origin at the bottom left. Pixels fainter
+/// than `minAlpha` (0...255) don't count, which leaves out a soft drop shadow.
+func opaqueBounds(_ px: Pixels, minAlpha: UInt8 = 25) -> NSRect {
     let w = px.rep.pixelsWide, h = px.rep.pixelsHigh
     var minX = w, minY = h, maxX = -1, maxY = -1
     for row in 0..<h {
-        for col in 0..<w where px.data[(row * w + col) * 4 + 3] > 25 {
+        for col in 0..<w where px.data[(row * w + col) * 4 + 3] > minAlpha {
             minX = min(minX, col)
             maxX = max(maxX, col)
             minY = min(minY, h - 1 - row)
@@ -406,26 +445,52 @@ func opaqueBounds(_ px: Pixels) -> NSRect {
     return NSRect(x: minX, y: minY, width: maxX - minX + 1, height: maxY - minY + 1)
 }
 
+/// Points just inside each edge of `body`, along the middle half of each side so the
+/// rounded corners are skipped. Used to tell an icon's background from its artwork.
+func edgeSamples(_ body: NSRect) -> [NSPoint] {
+    let inset = body.width * 0.04
+    var points: [NSPoint] = []
+    for step in 0..<48 {
+        let f = 0.25 + 0.5 * CGFloat(step) / 47
+        points.append(NSPoint(x: body.minX + inset, y: body.minY + body.height * f))
+        points.append(NSPoint(x: body.maxX - inset, y: body.minY + body.height * f))
+        points.append(NSPoint(x: body.minX + body.width * f, y: body.minY + inset))
+        points.append(NSPoint(x: body.minX + body.width * f, y: body.maxY - inset))
+    }
+    return points
+}
+
+/// Pixel index for a point (origin bottom left), or nil outside the bitmap.
+func pixelIndex(_ p: NSPoint, width: Int, height: Int) -> Int? {
+    let col = Int(p.x), row = height - 1 - Int(p.y)
+    guard col >= 0, col < width, row >= 0, row < height else { return nil }
+    return row * width + col
+}
+
 enum Badge {
     case symbol(Symbol)
     case letter(String)
     case none
 }
 
-/// A white disc in the bottom-right corner of `bounds`, holding the symbol or letter in `color`.
-func drawBadge(_ badge: Badge, color: RGB, in bounds: NSRect, canvasSize: CGFloat) {
+/// A white disc in the bottom-right corner of `body`, inside the rounded outline so macOS
+/// still sees a standard icon shape. The symbol or letter is drawn in `color`, or, with
+/// `knockout`, cut out of the disc (for layered icons, whose fill color shows through).
+func drawBadge(_ badge: Badge, color: RGB, body: NSRect, knockout: Bool) {
     if case .none = badge { return }
-    let diameter = bounds.width * 0.40
-    let center = NSPoint(x: min(canvasSize - diameter / 2 - 2, bounds.maxX - diameter * 0.36),
-                         y: max(diameter / 2 + 2, bounds.minY + diameter * 0.36))
-    let disc = NSRect(x: center.x - diameter / 2, y: center.y - diameter / 2, width: diameter, height: diameter)
+    let diameter = body.width * 0.38
+    let margin = body.width * 0.05
+    let disc = NSRect(x: body.maxX - margin - diameter, y: body.minY + margin, width: diameter, height: diameter)
+    let center = NSPoint(x: disc.midX, y: disc.midY)
 
     NSGraphicsContext.saveGraphicsState()
-    let shadow = NSShadow()
-    shadow.shadowColor = NSColor(white: 0, alpha: 0.28)
-    shadow.shadowOffset = NSSize(width: 0, height: -diameter * 0.035)
-    shadow.shadowBlurRadius = diameter * 0.09
-    shadow.set()
+    if !knockout {
+        let shadow = NSShadow()
+        shadow.shadowColor = NSColor(white: 0, alpha: 0.22)
+        shadow.shadowOffset = NSSize(width: 0, height: -diameter * 0.025)
+        shadow.shadowBlurRadius = diameter * 0.06
+        shadow.set()
+    }
     NSColor.white.setFill()
     NSBezierPath(ovalIn: disc).fill()
     NSGraphicsContext.restoreGraphicsState()
@@ -434,25 +499,90 @@ func drawBadge(_ badge: Badge, color: RGB, in bounds: NSRect, canvasSize: CGFloa
     var ink = toHSV(color.r, color.g, color.b)
     if ink.v > 0.8 && ink.s < 0.5 { ink.v = 0.6 }
     let rgb = toRGB(ink)
-    let inkColor = RGB(r: rgb.0, g: rgb.1, b: rgb.2).color
+    let inkColor = knockout ? NSColor.black : RGB(r: rgb.0, g: rgb.1, b: rgb.2).color
 
     switch badge {
     case .symbol(let symbol):
         let k = diameter * 1.62
         drawSymbol(symbol, map: { NSPoint(x: center.x + ($0 - 0.5) * k, y: center.y + ($1 - 0.5) * k) },
-                   scale: k, ink: inkColor, background: .white)
+                   scale: k, ink: inkColor, background: .white, knockout: knockout)
     case .letter(let letter):
+        NSGraphicsContext.saveGraphicsState()
+        if knockout { NSGraphicsContext.current?.cgContext.setBlendMode(.destinationOut) }
         drawLetter(letter, center: center, height: diameter * 0.56, color: inkColor)
+        NSGraphicsContext.restoreGraphicsState()
     case .none:
         break
     }
 }
 
+/// The app's icon artwork in its Default (light) style. The bundled .icns is preferred: it is
+/// the app's plain artwork, while the icon macOS hands out follows the Dock's current style,
+/// so a Dark or Tinted setting would get baked into the launcher's icon.
+func sourceIcon(_ app: String) -> NSImage {
+    guard FileManager.default.fileExists(atPath: app) else { fail("app not found: \(app)") }
+    let contents = URL(fileURLWithPath: app).appendingPathComponent("Contents")
+    let resources = contents.appendingPathComponent("Resources")
+    var names: [String] = []
+    if let info = NSDictionary(contentsOf: contents.appendingPathComponent("Info.plist")),
+       let name = info["CFBundleIconFile"] as? String, !name.isEmpty {
+        names.append(name.hasSuffix(".icns") ? name : name + ".icns")
+    }
+    let files = (try? FileManager.default.contentsOfDirectory(atPath: resources.path)) ?? []
+    names += files.filter { $0.hasSuffix(".icns") }.sorted()
+    for name in names {
+        if let image = NSImage(contentsOf: resources.appendingPathComponent(name)), image.isValid {
+            return image
+        }
+    }
+    return NSWorkspace.shared.icon(forFile: app)
+}
+
 func appIcon(_ path: String, size: Int) -> NSBitmapImageRep {
-    guard FileManager.default.fileExists(atPath: path) else { fail("app not found: \(path)") }
-    let icon = NSWorkspace.shared.icon(forFile: path)
+    let icon = sourceIcon(path)
+    let light = NSAppearance(named: .aqua) ?? NSAppearance.currentDrawing()
     return canvas(size) { dim in
-        icon.draw(in: NSRect(x: 0, y: 0, width: dim, height: dim), from: .zero, operation: .sourceOver, fraction: 1)
+        light.performAsCurrentDrawingAppearance {
+            icon.draw(in: NSRect(x: 0, y: 0, width: dim, height: dim), from: .zero, operation: .sourceOver, fraction: 1)
+        }
+    }
+}
+
+/// Redraws an icon so its visible body fills the macOS icon grid and outline, whatever
+/// padding or shadow the source had.
+func normalized(_ source: NSBitmapImageRep) -> NSBitmapImageRep {
+    let px = Pixels(source)
+    let w = source.pixelsWide, h = source.pixelsHigh
+    let found = opaqueBounds(px, minAlpha: 150)
+    let side = max(found.width, found.height)
+    let body = NSRect(x: found.midX - side / 2, y: found.midY - side / 2, width: side, height: side)
+
+    // The color just inside the edges fills the outline first, so no transparent sliver shows
+    // where the source's corners are rounder than the outline.
+    var sum = (r: 0.0, g: 0.0, b: 0.0, n: 0.0)
+    for point in edgeSamples(body) {
+        guard let i = pixelIndex(point, width: w, height: h) else { continue }
+        let p = px.get(i)
+        guard p.a > 0.9 else { continue }
+        sum = (sum.r + p.r, sum.g + p.g, sum.b + p.b, sum.n + 1)
+    }
+    let base: NSColor? = sum.n > 0 ? NSColor(srgbRed: CGFloat(sum.r / sum.n), green: CGFloat(sum.g / sum.n),
+                                             blue: CGFloat(sum.b / sum.n), alpha: 1) : nil
+
+    let image = NSImage(size: source.size)
+    image.addRepresentation(source)
+    return canvas(w) { dim in
+        let target = iconBody(dim)
+        let outline = squircle(target)
+        outline.addClip()
+        if let base = base {
+            base.setFill()
+            outline.fill()
+        }
+        let k = target.width / side
+        image.draw(in: NSRect(x: target.minX - body.minX * k, y: target.minY - body.minY * k,
+                              width: CGFloat(w) * k, height: CGFloat(h) * k),
+                   from: .zero, operation: .sourceOver, fraction: 1)
     }
 }
 
@@ -493,52 +623,56 @@ func buildAssetsCar(foreground: NSBitmapImageRep, fill: RGB, output: URL) -> Boo
 
 func renderAppIcon(app: String, color: RGB, badge: Badge, output: URL, assetsCar: URL?) {
     let size = 1024
-    let master = appIcon(app, size: size)
+    let master = normalized(appIcon(app, size: size))
     let px = Pixels(master)
     let weights = recolor(px, to: color)
-    let bounds = opaqueBounds(px)
     let image = NSImage(size: NSSize(width: size, height: size))
     image.addRepresentation(master)
 
     writeIcns(to: output) { dim in
         image.draw(in: NSRect(x: 0, y: 0, width: dim, height: dim), from: .zero, operation: .sourceOver, fraction: 1)
-        let scale = dim / CGFloat(size)
-        let scaled = NSRect(x: bounds.minX * scale, y: bounds.minY * scale,
-                            width: bounds.width * scale, height: bounds.height * scale)
-        drawBadge(badge, color: color, in: scaled, canvasSize: dim)
+        drawBadge(badge, color: color, body: iconBody(dim), knockout: false)
     }
 
     guard let assetsCar = assetsCar else { return }
-    // Layered version: the brand-colored parts and the badge become the foreground, cropped
-    // to the icon's own bounds because Icon Composer artwork fills the whole canvas.
+    // Layered version: macOS 26 draws the Default, Dark, Clear and Tinted styles from a solid
+    // fill plus artwork layers. The fill is the icon's background, whichever color it is: for
+    // Claude that is the brand color behind a white mark, for other apps it may be the reverse.
+    let body = iconBody(CGFloat(size))
+    var edge = 0.0, edgeCount = 0.0
+    for point in edgeSamples(body) {
+        guard let i = pixelIndex(point, width: size, height: size) else { continue }
+        edge += weights[i]
+        edgeCount += 1
+    }
+    let brandIsBackground = edgeCount > 0 && edge / edgeCount > 0.5
+
     var fill = (r: 0.0, g: 0.0, b: 0.0, n: 0.0)
-    for i in 0..<px.count where weights[i] < 0.05 {
+    for i in 0..<px.count where brandIsBackground ? weights[i] > 0.95 : weights[i] < 0.05 {
         let p = px.get(i)
         guard p.a > 0.9 else { continue }
         fill = (fill.r + p.r, fill.g + p.g, fill.b + p.b, fill.n + 1)
     }
     let background = fill.n > 0 ? RGB(r: fill.r / fill.n, g: fill.g / fill.n, b: fill.b / fill.n) : color
-    // Mask a fresh copy: the master may already be cached as an image from drawing the .icns.
+
+    // Mask a fresh copy down to the artwork: the master may already be cached from the .icns.
     let masked = canvas(size) { dim in
         image.draw(in: NSRect(x: 0, y: 0, width: dim, height: dim), from: .zero, operation: .copy, fraction: 1)
     }
     let maskedPx = Pixels(masked)
     for i in 0..<maskedPx.count {
         let p = maskedPx.get(i)
-        maskedPx.set(i, p.r, p.g, p.b, p.a * weights[i])
+        let keep = brandIsBackground ? 1 - weights[i] : weights[i]
+        maskedPx.set(i, p.r, p.g, p.b, p.a * keep)
     }
     let layer = NSImage(size: NSSize(width: size, height: size))
     layer.addRepresentation(masked)
-    // Crop to a square around the visible icon, so a shadow or odd shape doesn't shift it.
-    let side = max(bounds.width, bounds.height)
-    let crop = NSRect(x: bounds.midX - side / 2, y: bounds.midY - side / 2, width: side, height: side)
+    // Icon Composer artwork covers the whole canvas, so scale the icon body up to fill it.
     let foreground = canvas(size) { dim in
-        let k = dim / side
-        layer.draw(in: NSRect(x: -crop.minX * k, y: -crop.minY * k, width: CGFloat(size) * k, height: CGFloat(size) * k),
+        let k = dim / body.width
+        layer.draw(in: NSRect(x: -body.minX * k, y: -body.minY * k, width: CGFloat(size) * k, height: CGFloat(size) * k),
                    from: .zero, operation: .sourceOver, fraction: 1)
-        // Keep the badge inside the rounded mask macOS applies to layered icons.
-        drawBadge(badge, color: color, in: NSRect(x: 0, y: 0, width: dim, height: dim).insetBy(dx: dim * 0.09, dy: dim * 0.09),
-                  canvasSize: dim)
+        drawBadge(badge, color: color, body: NSRect(x: 0, y: 0, width: dim, height: dim), knockout: true)
     }
     if !buildAssetsCar(foreground: foreground, fill: background, output: assetsCar) {
         fputs("generate_icons: skipped the layered icon (needs Xcode 26's actool)\n", stderr)
