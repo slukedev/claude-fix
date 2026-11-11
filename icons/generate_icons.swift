@@ -6,13 +6,14 @@
 //
 //   generate_icons --app /Applications/Claude.app --output applet.icns
 //       [--symbol NAME | --letter L | --no-badge] [--color NAME | #RRGGBB]
-//       [--assets-car Assets.car] [--symbols glyphs.json]
+//       [--dark-output dark.icns] [--assets-car Assets.car] [--symbols glyphs.json]
 //       Recolor the app's own icon (its Default style, whatever style the Dock is set to)
 //       and add a badge. Because the icon is read from the installed app, launchers follow
 //       Claude's icon when it changes. The result is redrawn on the standard macOS icon grid
 //       and outline, so it sits at the same size as other Dock icons. With --assets-car and
 //       Xcode 26's actool available, also build a layered icon so macOS can draw its
-//       Default, Dark, Clear and Tinted styles.
+//       Default, Dark, Clear and Tinted styles. --dark-output also writes a static icon in
+//       the Dark style, for places that only take a single image.
 //
 //   generate_icons --index N --letter L --output out.icns
 //       Flat letter icon in palette color N.
@@ -508,14 +509,20 @@ enum Badge {
     case none
 }
 
+/// Where the badge goes: a disc in the bottom-right corner of `body`, inside the rounded outline.
+func badgeDisc(in body: NSRect) -> NSRect {
+    let diameter = body.width * 0.38
+    let margin = body.width * 0.05
+    return NSRect(x: body.maxX - margin - diameter, y: body.minY + margin, width: diameter, height: diameter)
+}
+
 /// A white disc in the bottom-right corner of `body`, inside the rounded outline so macOS
 /// still sees a standard icon shape. The symbol or letter is drawn in `color`, or, with
 /// `knockout`, cut out of the disc (for layered icons, whose fill color shows through).
 func drawBadge(_ badge: Badge, color: RGB, body: NSRect, knockout: Bool) {
     if case .none = badge { return }
-    let diameter = body.width * 0.38
-    let margin = body.width * 0.05
-    let disc = NSRect(x: body.maxX - margin - diameter, y: body.minY + margin, width: diameter, height: diameter)
+    let disc = badgeDisc(in: body)
+    let diameter = disc.width
     let center = NSPoint(x: disc.midX, y: disc.midY)
 
     NSGraphicsContext.saveGraphicsState()
@@ -621,9 +628,40 @@ func normalized(_ source: NSBitmapImageRep) -> NSBitmapImageRep {
     }
 }
 
+struct IconLayer {
+    let name: String
+    let image: NSBitmapImageRep
+    /// The color this layer is painted in the Dark icon style, if it changes there.
+    let darkFill: RGB?
+}
+
+func srgb(_ c: RGB) -> String {
+    "srgb:\(String(format: "%.5f,%.5f,%.5f", c.r, c.g, c.b)),1.00000"
+}
+
+/// icon.json for an Icon Composer file: a solid fill with the layers on top. With
+/// `darkColors`, layers that have a dark fill are painted in it in the Dark style, the way
+/// Claude's own mark turns orange on black.
+func iconJSON(fill: RGB, layers: [IconLayer], darkColors: Bool) -> String {
+    let entries = layers.map { layer -> String in
+        var entry = "{ \"image-name\" : \"\(layer.name).png\", \"name\" : \"\(layer.name)\""
+        if darkColors, let dark = layer.darkFill {
+            entry += ", \"fill-specializations\" : [ { \"appearance\" : \"dark\", \"value\" : { \"solid\" : \"\(srgb(dark))\" } } ]"
+        }
+        return entry + " }"
+    }
+    return """
+    {
+      "fill" : { "solid" : "\(srgb(fill))" },
+      "groups" : [ { "layers" : [ \(entries.joined(separator: ", ")) ] } ],
+      "supported-platforms" : { "squares" : "shared" }
+    }
+    """
+}
+
 /// Writes a layered Icon Composer file and compiles it with actool. macOS 26 draws the
 /// Default, Dark, Clear and Tinted styles from the layers. Needs Xcode 26; returns false otherwise.
-func buildAssetsCar(foreground: NSBitmapImageRep, fill: RGB, output: URL) -> Bool {
+func buildAssetsCar(layers: [IconLayer], fill: RGB, output: URL) -> Bool {
     let environments = actoolEnvironments()
     guard !environments.isEmpty else { return false }
     let work = temporaryDirectory()
@@ -631,52 +669,68 @@ func buildAssetsCar(foreground: NSBitmapImageRep, fill: RGB, output: URL) -> Boo
     let bundle = work.appendingPathComponent("AppIcon.icon")
     let assets = bundle.appendingPathComponent("Assets")
     let compiled = work.appendingPathComponent("compiled")
-    let json = """
-    {
-      "fill" : { "solid" : "srgb:\(String(format: "%.5f,%.5f,%.5f", fill.r, fill.g, fill.b)),1.00000" },
-      "groups" : [ { "layers" : [ { "image-name" : "foreground.png", "name" : "foreground" } ] } ],
-      "supported-platforms" : { "squares" : "shared" }
-    }
-    """
     do {
         try FileManager.default.createDirectory(at: assets, withIntermediateDirectories: true)
         try FileManager.default.createDirectory(at: compiled, withIntermediateDirectories: true)
-        try pngData(foreground).write(to: assets.appendingPathComponent("foreground.png"))
-        try json.write(to: bundle.appendingPathComponent("icon.json"), atomically: true, encoding: .utf8)
+        for layer in layers {
+            try pngData(layer.image).write(to: assets.appendingPathComponent("\(layer.name).png"))
+        }
     } catch {
         return false
     }
     let car = compiled.appendingPathComponent("Assets.car")
-    // An older Xcode's actool can't read .icon files, so try each until one compiles it.
-    let built = environments.contains { environment in
-        run("/usr/bin/xcrun", [
-            "actool", bundle.path, "--compile", compiled.path, "--platform", "macosx",
-            "--minimum-deployment-target", "11.0", "--app-icon", "AppIcon", "--include-all-app-icons",
-            "--output-partial-info-plist", work.appendingPathComponent("partial.plist").path,
-        ], environment: environment) && FileManager.default.fileExists(atPath: car.path)
+    // Dark colors first; if no actool accepts them, a plain layered icon still beats none.
+    for darkColors in [true, false] {
+        guard (try? iconJSON(fill: fill, layers: layers, darkColors: darkColors)
+            .write(to: bundle.appendingPathComponent("icon.json"), atomically: true, encoding: .utf8)) != nil else {
+            return false
+        }
+        // An older Xcode's actool can't read .icon files, so try each until one compiles it.
+        let built = environments.contains { environment in
+            run("/usr/bin/xcrun", [
+                "actool", bundle.path, "--compile", compiled.path, "--platform", "macosx",
+                "--minimum-deployment-target", "11.0", "--app-icon", "AppIcon", "--include-all-app-icons",
+                "--output-partial-info-plist", work.appendingPathComponent("partial.plist").path,
+            ], environment: environment) && FileManager.default.fileExists(atPath: car.path)
+        }
+        if built {
+            try? FileManager.default.removeItem(at: output)
+            return (try? FileManager.default.copyItem(at: car, to: output)) != nil
+        }
     }
-    guard built else { return false }
-    try? FileManager.default.removeItem(at: output)
-    return (try? FileManager.default.copyItem(at: car, to: output)) != nil
+    return false
 }
 
-func renderAppIcon(app: String, color: RGB, badge: Badge, output: URL, assetsCar: URL?) {
+/// The profile color, brightened enough to stand out on a dark icon.
+func darkInk(_ c: RGB) -> RGB {
+    var hsv = toHSV(c.r, c.g, c.b)
+    hsv.v = max(hsv.v, 0.92)
+    let rgb = toRGB(hsv)
+    return RGB(r: rgb.0, g: rgb.1, b: rgb.2)
+}
+
+func image(_ rep: NSBitmapImageRep) -> NSImage {
+    let result = NSImage(size: rep.size)
+    result.addRepresentation(rep)
+    return result
+}
+
+func renderAppIcon(app: String, color: RGB, badge: Badge, output: URL, darkOutput: URL?, assetsCar: URL?) {
     let size = 1024
+    let full = NSRect(x: 0, y: 0, width: size, height: size)
     let master = normalized(appIcon(app, size: size))
     let px = Pixels(master)
     let weights = recolor(px, to: color)
-    let image = NSImage(size: NSSize(width: size, height: size))
-    image.addRepresentation(master)
+    let recolored = image(master)
 
     writeIcns(to: output) { dim in
-        image.draw(in: NSRect(x: 0, y: 0, width: dim, height: dim), from: .zero, operation: .sourceOver, fraction: 1)
+        recolored.draw(in: NSRect(x: 0, y: 0, width: dim, height: dim), from: .zero, operation: .sourceOver, fraction: 1)
         drawBadge(badge, color: color, body: iconBody(dim), knockout: false)
     }
+    guard darkOutput != nil || assetsCar != nil else { return }
 
-    guard let assetsCar = assetsCar else { return }
-    // Layered version: macOS 26 draws the Default, Dark, Clear and Tinted styles from a solid
-    // fill plus artwork layers. The fill is the icon's background, whichever color it is: for
-    // Claude that is the brand color behind a white mark, for other apps it may be the reverse.
+    // Split the icon into its background and its artwork (Claude's mark). For Claude the
+    // background is the brand color behind a white mark; other apps may be the reverse.
     let body = iconBody(CGFloat(size))
     var edge = 0.0, edgeCount = 0.0
     for point in edgeSamples(body) {
@@ -686,37 +740,82 @@ func renderAppIcon(app: String, color: RGB, badge: Badge, output: URL, assetsCar
     }
     let brandIsBackground = edgeCount > 0 && edge / edgeCount > 0.5
 
-    var fill = (r: 0.0, g: 0.0, b: 0.0, n: 0.0)
+    var sum = (r: 0.0, g: 0.0, b: 0.0, n: 0.0)
     for i in 0..<px.count where brandIsBackground ? weights[i] > 0.95 : weights[i] < 0.05 {
         let p = px.get(i)
         guard p.a > 0.9 else { continue }
-        fill = (fill.r + p.r, fill.g + p.g, fill.b + p.b, fill.n + 1)
+        sum = (sum.r + p.r, sum.g + p.g, sum.b + p.b, sum.n + 1)
     }
-    let background = fill.n > 0 ? RGB(r: fill.r / fill.n, g: fill.g / fill.n, b: fill.b / fill.n) : color
+    let background = sum.n > 0 ? RGB(r: sum.r / sum.n, g: sum.g / sum.n, b: sum.b / sum.n) : color
 
     // Mask a fresh copy down to the artwork: the master may already be cached from the .icns.
-    let masked = canvas(size) { dim in
-        image.draw(in: NSRect(x: 0, y: 0, width: dim, height: dim), from: .zero, operation: .copy, fraction: 1)
+    let artworkRep = canvas(size) { dim in
+        recolored.draw(in: NSRect(x: 0, y: 0, width: dim, height: dim), from: .zero, operation: .copy, fraction: 1)
     }
-    let maskedPx = Pixels(masked)
-    for i in 0..<maskedPx.count {
-        let p = maskedPx.get(i)
+    let artworkPx = Pixels(artworkRep)
+    for i in 0..<artworkPx.count {
+        let p = artworkPx.get(i)
         let keep = brandIsBackground ? 1 - weights[i] : weights[i]
-        maskedPx.set(i, p.r, p.g, p.b, p.a * keep)
+        artworkPx.set(i, p.r, p.g, p.b, p.a * keep)
     }
-    let layer = NSImage(size: NSSize(width: size, height: size))
-    layer.addRepresentation(masked)
+    let artwork = image(artworkRep)
+    let ink = darkInk(color)
+
+    // Static dark version, for places that can't hold a layered icon (the Dock tile of a
+    // profile's own copy of Claude): Claude's dark look, the mark in the profile color.
+    if let darkOutput = darkOutput {
+        let tinted = image(canvas(size) { dim in
+            let rect = NSRect(x: 0, y: 0, width: dim, height: dim)
+            artwork.draw(in: rect, from: .zero, operation: .copy, fraction: 1)
+            ink.color.setFill()
+            rect.fill(using: .sourceAtop)
+        })
+        writeIcns(to: darkOutput) { dim in
+            let rect = NSRect(x: 0, y: 0, width: dim, height: dim)
+            let outline = squircle(iconBody(dim))
+            NSGradient(starting: NSColor(white: 0.18, alpha: 1), ending: NSColor(white: 0.06, alpha: 1))?
+                .draw(in: outline, angle: -90)
+            tinted.draw(in: rect, from: .zero, operation: .sourceOver, fraction: 1)
+            drawBadge(badge, color: color, body: iconBody(dim), knockout: false)
+        }
+    }
+
+    guard let assetsCar = assetsCar else { return }
     // Icon Composer artwork covers the whole canvas, so scale the icon body up to fill it.
-    let foreground = canvas(size) { dim in
-        let k = dim / body.width
-        layer.draw(in: NSRect(x: -body.minX * k, y: -body.minY * k, width: CGFloat(size) * k, height: CGFloat(size) * k),
-                   from: .zero, operation: .sourceOver, fraction: 1)
-        drawBadge(badge, color: color, body: NSRect(x: 0, y: 0, width: dim, height: dim), knockout: true)
+    // The layers don't overlap, so their order doesn't matter: the mark (minus the badge's
+    // spot), the white badge disc with its symbol cut out, and the symbol itself.
+    let k = CGFloat(size) / body.width
+    let scaled = NSRect(x: -body.minX * k, y: -body.minY * k, width: CGFloat(size) * k, height: CGFloat(size) * k)
+    let hasBadge: Bool
+    if case .none = badge { hasBadge = false } else { hasBadge = true }
+
+    let mark = canvas(size) { _ in
+        artwork.draw(in: scaled, from: .zero, operation: .sourceOver, fraction: 1)
+        if hasBadge {
+            NSGraphicsContext.saveGraphicsState()
+            NSGraphicsContext.current?.cgContext.setBlendMode(.destinationOut)
+            NSColor.black.setFill()
+            NSBezierPath(ovalIn: badgeDisc(in: full)).fill()
+            NSGraphicsContext.restoreGraphicsState()
+        }
     }
-    if !buildAssetsCar(foreground: foreground, fill: background, output: assetsCar) {
+    var layers = [IconLayer(name: "mark", image: mark, darkFill: ink)]
+    if hasBadge {
+        let discRep = canvas(size) { _ in drawBadge(badge, color: color, body: full, knockout: true) }
+        let disc = image(discRep)
+        let symbolRep = canvas(size) { _ in
+            color.color.setFill()
+            NSBezierPath(ovalIn: badgeDisc(in: full)).fill()
+            disc.draw(in: full, from: .zero, operation: .destinationOut, fraction: 1)
+        }
+        layers.append(IconLayer(name: "badge", image: discRep, darkFill: nil))
+        layers.append(IconLayer(name: "symbol", image: symbolRep, darkFill: nil))
+    }
+    if !buildAssetsCar(layers: layers, fill: background, output: assetsCar) {
         fputs("generate_icons: skipped the layered icon (needs Xcode 26's actool)\n", stderr)
     }
 }
+
 
 // MARK: - Command line
 
@@ -770,6 +869,7 @@ if let app = options["--app"] {
     }
     guard let target = color else { fail("--color is required with --letter or --no-badge") }
     renderAppIcon(app: app, color: target, badge: badge, output: URL(fileURLWithPath: output),
+                  darkOutput: options["--dark-output"].map { URL(fileURLWithPath: $0) },
                   assetsCar: options["--assets-car"].map { URL(fileURLWithPath: $0) })
     exit(0)
 }

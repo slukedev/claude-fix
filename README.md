@@ -493,6 +493,14 @@ of other Dock icons. The badge sits inside the icon's outline.
 On macOS 26, icons built with Xcode 26 installed come with their own Dark, Clear and
 Tinted looks, because the recolored artwork and badge are compiled as a layered icon
 (a solid fill in the profile color, with Claude's mark and a cut-out badge on top).
+In the Dark style the profile color moves onto Claude's mark on a dark background, the
+same way Claude's own icon turns orange on black.
+
+A profile's own copy of Claude (the one pinned in the Dock) can only carry a single
+image as its icon, so it gets a light and a dark version and the Dock watcher swaps
+them when macOS switches between light and dark mode. Clear and Tinted use macOS's
+automatic treatment there.
+
 Xcode only has to be installed, not selected with `xcode-select`. Without it, launcher
 icons keep their light look in every style, and `claude-fix` says so when it draws them.
 
@@ -811,6 +819,8 @@ To regenerate the flat fallback icons after changing `icons/glyphs.json`, run
   Tinted styles on macOS 26
 - Icons no longer bake in the Dock's Dark style when drawn while it is on, and are
   drawn at full size on the macOS icon grid with the badge inside the outline
+- Layered icons color Claude's mark in the profile color in the Dark style, and the
+  Dock copy of each profile switches between a light and a dark icon with the system
 - Launchers get their own bundle ID, are re-signed after editing, and are
   registered with Launch Services, so icon changes show up
 - Desktop shortcuts are symlinks, and `clean` removes them

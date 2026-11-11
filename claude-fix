@@ -336,7 +336,7 @@ generate_profile_icon() {
   local label="$1" res="$2" custom symbol args
   ICON_ARGS=""
   ICON_ASSET_NAME=""
-  rm -f "$res/Assets.car"
+  rm -f "$res/Assets.car" "$res/applet-dark.icns"
   custom=$(custom_icon_path "$label")
   if [ -f "$custom" ]; then
     cp "$custom" "$res/applet.icns"
@@ -351,7 +351,7 @@ generate_profile_icon() {
   if resolve_icon_tool; then
     # shellcheck disable=SC2086 # args are single words
     if "$ICON_TOOL" --app "$CLAUDE_APP" $args --output "$res/applet.icns" \
-      --assets-car "$res/Assets.car" >/dev/null 2>&1; then
+      --dark-output "$res/applet-dark.icns" --assets-car "$res/Assets.car" >/dev/null 2>&1; then
       ICON_ARGS="$args"
       if [ -f "$res/Assets.car" ]; then
         ICON_ASSET_NAME="AppIcon"
@@ -360,7 +360,7 @@ generate_profile_icon() {
       fi
       return 0
     fi
-    rm -f "$res/Assets.car"
+    rm -f "$res/Assets.car" "$res/applet-dark.icns"
   fi
   flat_profile_icon "$label" "$symbol" "$res/applet.icns"
 }
@@ -1492,6 +1492,15 @@ claim_later() {
   open -g "claude-fix://background" >/dev/null 2>&1 || true
 }
 
+# Whether macOS is in dark mode. The Dock watcher passes what it sees; otherwise ask defaults.
+is_dark_mode() {
+  case "${CLAUDE_FIX_DARK:-}" in
+    1) return 0 ;;
+    0) return 1 ;;
+  esac
+  [ "$(defaults read -g AppleInterfaceStyle 2>/dev/null)" = "Dark" ]
+}
+
 # Own-app profiles run from their own copy of Claude.app, so the Dock and the app switcher
 # show the profile's icon. The copy is an unmodified APFS clone, so Anthropic's signature
 # stays valid; the icon is set the way Finder's Get Info does it, outside the signed files.
@@ -1533,6 +1542,11 @@ own_app_sync() {
   # The Dock watcher opens a copy started without its profile through this launcher.
   [ "$(cat "$dir/launcher" 2>/dev/null)" = "$APPS/Claude $label.app" ] ||
     printf '%s\n' "$APPS/Claude $label.app" >"$dir/launcher"
+  # A Finder custom icon is a single image, so swap in the dark one while macOS is dark.
+  # The Dock watcher runs this again whenever the appearance changes.
+  if [ -f "${icon%.icns}-dark.icns" ] && is_dark_mode; then
+    icon="${icon%.icns}-dark.icns"
+  fi
   if [ -f "$icon" ]; then
     sum=$(cksum <"$icon" | awk '{print $1}')
     if [ "$sum" != "$(cat "$dir/icon.sum" 2>/dev/null)" ] || [ ! -e "$dest/Icon"$'\r' ]; then
@@ -1615,8 +1629,14 @@ cmd_icon_refresh() {
   bundle=$(cd "$HERE/../.." && pwd)
   tmp=$(mktemp -d "${TMPDIR:-/tmp}/claude-fix-icon.XXXXXX")
   # shellcheck disable=SC2086 # icon-args holds single words
-  if "$tool" --app "$app" $args --output "$tmp/applet.icns" --assets-car "$tmp/Assets.car" >/dev/null 2>&1; then
+  if "$tool" --app "$app" $args --output "$tmp/applet.icns" --dark-output "$tmp/applet-dark.icns" \
+    --assets-car "$tmp/Assets.car" >/dev/null 2>&1; then
     cp "$tmp/applet.icns" "$HERE/applet.icns"
+    if [ -f "$tmp/applet-dark.icns" ]; then
+      cp "$tmp/applet-dark.icns" "$HERE/applet-dark.icns"
+    else
+      rm -f "$HERE/applet-dark.icns"
+    fi
     if [ -f "$tmp/Assets.car" ]; then
       cp "$tmp/Assets.car" "$HERE/Assets.car"
       plutil -replace CFBundleIconName -string AppIcon "$bundle/Contents/Info.plist" >/dev/null 2>&1
@@ -2279,6 +2299,27 @@ func check(_ app: NSRunningApplication, tries: Int = 0) {
   try? task.run()
 }
 
+// A copy's icon is a single image, so when macOS switches between light and dark, have each
+// profile's launcher set the matching one.
+var lastDark: Bool?
+func syncIcons() {
+  let dark = NSApplication.shared.effectiveAppearance.bestMatch(from: [.aqua, .darkAqua]) == .darkAqua
+  if dark == lastDark { return }
+  lastDark = dark
+  let dirs = (try? FileManager.default.contentsOfDirectory(atPath: root)) ?? []
+  for dir in dirs {
+    guard let launcher = try? String(contentsOfFile: root + dir + "/launcher", encoding: .utf8)
+      .trimmingCharacters(in: .whitespacesAndNewlines), !launcher.isEmpty else { continue }
+    let task = Process()
+    task.executableURL = URL(fileURLWithPath: "/bin/bash")
+    task.arguments = [launcher + "/Contents/Resources/claude-fix.sh", "own-app-sync"]
+    task.environment = ProcessInfo.processInfo.environment.merging(["CLAUDE_FIX_DARK": dark ? "1" : "0"]) { $1 }
+    task.standardOutput = FileHandle.nullDevice
+    task.standardError = FileHandle.nullDevice
+    try? task.run()
+  }
+}
+
 let workspace = NSWorkspace.shared
 func scan() {
   for app in workspace.runningApplications { check(app) }
@@ -2297,7 +2338,17 @@ center.addObserver(forName: NSWorkspace.didTerminateApplicationNotification, obj
 }
 let application = NSApplication.shared
 _ = application.setActivationPolicy(.prohibited)
-withExtendedLifetime(observation) { application.run() }
+DistributedNotificationCenter.default().addObserver(
+  forName: NSNotification.Name("AppleInterfaceThemeChangedNotification"), object: nil, queue: .main
+) { _ in
+  // The app's appearance catches up a moment after the notification.
+  DispatchQueue.main.asyncAfter(deadline: .now() + 0.5) { syncIcons() }
+}
+let appearanceObservation = application.observe(\.effectiveAppearance, options: [.new]) { _, _ in
+  DispatchQueue.main.async { syncIcons() }
+}
+DispatchQueue.main.async { syncIcons() }
+withExtendedLifetime((observation, appearanceObservation)) { application.run() }
 SWIFT
 }
 
