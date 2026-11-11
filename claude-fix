@@ -1399,6 +1399,7 @@ write_runtime_helper() {
 #   claim [BUNDLE_ID]   make BUNDLE_ID (default: the picker) handle claude:// links
 #   icon-refresh        redraw this launcher's icon if Claude's icon or macOS changed
 #   own-app-sync        create or refresh the profile's own copy of Claude
+#   own-app-icon        set the copy's icon for the current appearance (Dock watcher)
 #   background          (Claude Profiles) upgrade launchers if claude-fix was updated,
 #                       and refresh launcher icons
 set -uo pipefail
@@ -1504,11 +1505,71 @@ is_dark_mode() {
 # Own-app profiles run from their own copy of Claude.app, so the Dock and the app switcher
 # show the profile's icon. The copy is an unmodified APFS clone, so Anthropic's signature
 # stays valid; the icon is set the way Finder's Get Info does it, outside the signed files.
-own_app_sync() {
-  local label="$1" slug="$2" src="$3" icon="$4" dir dest old stamp sum
+# The launcher, the installer and the Dock watcher can all sync a copy at the same moment.
+# Two swaps at once could move a half-made copy into place (the Dock then shows a folder),
+# so each profile's copy is changed by one process at a time.
+own_app_lock() {
+  local lock="$1/.sync.lock" tries=0
+  # A lock left behind by a sync that died must not block syncs forever.
+  find "$lock" -maxdepth 0 -mmin +5 -exec rmdir {} \; 2>/dev/null || true
+  until mkdir "$lock" 2>/dev/null; do
+    tries=$((tries + 1))
+    [ "$tries" -ge 150 ] && return 1
+    sleep 0.2
+  done
+}
+
+own_app_unlock() {
+  rmdir "$1/.sync.lock" 2>/dev/null || true
+}
+
+# A copy is usable only if it is a whole app: an interrupted copy has no Info.plist or binary.
+own_app_complete() {
+  [ -f "$1/Contents/Info.plist" ] && [ -x "$1/Contents/MacOS/Claude" ]
+}
+
+# Sets the copy's Finder icon. A custom icon is a single image, so the dark one is used
+# while macOS is dark; the Dock watcher calls this again whenever the appearance changes.
+own_app_set_icon() {
+  local dir="$1" dest="$2" icon="$3" sum
+  if [ -f "${icon%.icns}-dark.icns" ] && is_dark_mode; then
+    icon="${icon%.icns}-dark.icns"
+  fi
+  [ -f "$icon" ] || return 0
+  sum=$(cksum <"$icon" | awk '{print $1}')
+  if [ "$sum" != "$(cat "$dir/icon.sum" 2>/dev/null)" ] || [ ! -e "$dest/Icon"$'\r' ]; then
+    if osascript -l JavaScript "$HERE/seticon.js" "$icon" "$dest" >/dev/null 2>&1; then
+      printf '%s\n' "$sum" >"$dir/icon.sum"
+    fi
+  fi
+}
+
+# Only the icon, for appearance changes: never copies or replaces the app itself.
+own_app_icon() {
+  local label="$1" slug="$2" icon="$3" dir dest
   dir="$STATE_DIR/apps/$slug"
   dest="$dir/Claude $label.app"
+  [ -d "$dir" ] || return 0
+  own_app_lock "$dir" || return 1
+  if own_app_complete "$dest"; then
+    own_app_set_icon "$dir" "$dest" "$icon"
+  fi
+  own_app_unlock "$dir"
+}
+
+own_app_sync() {
+  local dir="$STATE_DIR/apps/$2" status=0
   mkdir -p "$dir"
+  own_app_lock "$dir" || return 1
+  own_app_sync_locked "$@" || status=$?
+  own_app_unlock "$dir"
+  return "$status"
+}
+
+own_app_sync_locked() {
+  local label="$1" slug="$2" src="$3" icon="$4" dir dest old stamp
+  dir="$STATE_DIR/apps/$slug"
+  dest="$dir/Claude $label.app"
   if [ ! -d "$dest" ]; then
     for old in "$dir/"*.app; do
       if [ -d "$old" ]; then
@@ -1519,15 +1580,16 @@ own_app_sync() {
   fi
   stamp=$({ cat "$src/Contents/Info.plist"; ls -ln "$src/Contents/MacOS/Claude"; } 2>/dev/null | cksum | awk '{print $1}')
   # Never swap the copy out from under a running profile; it is refreshed on the next open.
-  if [ -d "$dest" ] && [ "$stamp" != "$(cat "$dir/source.stamp" 2>/dev/null)" ] &&
+  if own_app_complete "$dest" && [ "$stamp" != "$(cat "$dir/source.stamp" 2>/dev/null)" ] &&
     running_profile_pid "$HOME/$slug" >/dev/null; then
     stamp=$(cat "$dir/source.stamp" 2>/dev/null)
   fi
-  if [ ! -d "$dest" ] || [ "$stamp" != "$(cat "$dir/source.stamp" 2>/dev/null)" ]; then
+  # A missing or broken copy is made again.
+  if ! own_app_complete "$dest" || [ "$stamp" != "$(cat "$dir/source.stamp" 2>/dev/null)" ]; then
     rm -rf "$dir/.new.app"
     # Only an APFS clone, which costs almost no space. Elsewhere the profile keeps
     # running from Claude.app rather than taking a full copy of it.
-    if ! cp -cR "$src" "$dir/.new.app" 2>/dev/null; then
+    if ! cp -cR "$src" "$dir/.new.app" 2>/dev/null || ! own_app_complete "$dir/.new.app"; then
       rm -rf "$dir/.new.app"
       [ -d "$dest" ] || rmdir "$dir" 2>/dev/null
       return 1
@@ -1542,19 +1604,7 @@ own_app_sync() {
   # The Dock watcher opens a copy started without its profile through this launcher.
   [ "$(cat "$dir/launcher" 2>/dev/null)" = "$APPS/Claude $label.app" ] ||
     printf '%s\n' "$APPS/Claude $label.app" >"$dir/launcher"
-  # A Finder custom icon is a single image, so swap in the dark one while macOS is dark.
-  # The Dock watcher runs this again whenever the appearance changes.
-  if [ -f "${icon%.icns}-dark.icns" ] && is_dark_mode; then
-    icon="${icon%.icns}-dark.icns"
-  fi
-  if [ -f "$icon" ]; then
-    sum=$(cksum <"$icon" | awk '{print $1}')
-    if [ "$sum" != "$(cat "$dir/icon.sum" 2>/dev/null)" ] || [ ! -e "$dest/Icon"$'\r' ]; then
-      if osascript -l JavaScript "$HERE/seticon.js" "$icon" "$dest" >/dev/null 2>&1; then
-        printf '%s\n' "$sum" >"$dir/icon.sum"
-      fi
-    fi
-  fi
+  own_app_set_icon "$dir" "$dest" "$icon"
   printf '%s' "$dest"
 }
 
@@ -1718,12 +1768,15 @@ case "${1:-}" in
     app=$(claude_app) || exit 1
     own_app_sync "$label" "$(marker_value "$MARKER" data-dir)" "$app" "$HERE/applet.icns" || exit 1
     ;;
+  own-app-icon)
+    own_app_icon "$(marker_value "$MARKER" label)" "$(marker_value "$MARKER" data-dir)" "$HERE/applet.icns" || exit 1
+    ;;
   list) cmd_list ;;
   last) cat "$STATE_DIR/last-profile" 2>/dev/null || true ;;
   open) shift; cmd_open "$@" ;;
   claim) shift; cmd_claim "$@" ;;
   *)
-    echo "usage: claude-fix.sh launch|list|last|open NAME [URL]|claim [BUNDLE_ID]|icon-refresh|own-app-sync|background" >&2
+    echo "usage: claude-fix.sh launch|list|last|open NAME [URL]|claim [BUNDLE_ID]|icon-refresh|own-app-sync|own-app-icon|background" >&2
     exit 2
     ;;
 esac
@@ -2312,7 +2365,7 @@ func syncIcons() {
       .trimmingCharacters(in: .whitespacesAndNewlines), !launcher.isEmpty else { continue }
     let task = Process()
     task.executableURL = URL(fileURLWithPath: "/bin/bash")
-    task.arguments = [launcher + "/Contents/Resources/claude-fix.sh", "own-app-sync"]
+    task.arguments = [launcher + "/Contents/Resources/claude-fix.sh", "own-app-icon"]
     task.environment = ProcessInfo.processInfo.environment.merging(["CLAUDE_FIX_DARK": dark ? "1" : "0"]) { $1 }
     task.standardOutput = FileHandle.nullDevice
     task.standardError = FileHandle.nullDevice
