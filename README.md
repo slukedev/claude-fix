@@ -493,7 +493,8 @@ of other Dock icons. The badge sits inside the icon's outline.
 On macOS 26, icons built with Xcode 26 installed come with their own Dark, Clear and
 Tinted looks, because the recolored artwork and badge are compiled as a layered icon
 (a solid fill in the profile color, with Claude's mark and a cut-out badge on top).
-Without Xcode, macOS applies its automatic treatment for those styles.
+Xcode only has to be installed, not selected with `xcode-select`. Without it, launcher
+icons keep their light look in every style, and `claude-fix` says so when it draws them.
 
 Drawing Claude-style icons needs the Command Line Tools (`xcode-select --install`); the
 icon tool is compiled once into `~/.claude-fix/icon-tool`. Without them, launchers use

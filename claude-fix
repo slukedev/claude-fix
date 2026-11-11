@@ -30,6 +30,7 @@ COLOR_NAMES="indigo sage orange purple teal pink coral slate amber graphite gold
 PALETTE_NAMES="indigo sage orange purple teal pink coral slate"
 ICON_TOOL=""
 ICON_TOOL_CHECKED=0
+LAYERED_ICON_NOTED=0
 ICON_ARGS=""
 ICON_ASSET_NAME=""
 BUNDLE_ID_PREFIX="com.github.sarhej.claude-fix"
@@ -317,6 +318,18 @@ flat_profile_icon() {
   [ -f "$path" ] && cp "$path" "$out"
 }
 
+# On macOS 26, says once why launcher icons don't follow the Dark, Clear and Tinted styles.
+note_layered_icon_skipped() {
+  local major
+  [ "$LAYERED_ICON_NOTED" = "1" ] && return 0
+  LAYERED_ICON_NOTED=1
+  major=$(sw_vers -productVersion 2>/dev/null | cut -d. -f1)
+  case "$major" in '' | *[!0-9]*) return 0 ;; esac
+  [ "$major" -ge 26 ] || return 0
+  echo "NOTE: launcher icons stay light in the Dark, Clear and Tinted icon styles until" >&2
+  echo "      Xcode 26 or later is installed (free in the App Store). Then run: claude-fix upgrade" >&2
+}
+
 # Writes applet.icns (and Assets.car when available) into a bundle's Resources.
 # Sets ICON_ARGS when the icon was drawn from Claude's own icon, so it can be redrawn later.
 generate_profile_icon() {
@@ -340,7 +353,11 @@ generate_profile_icon() {
     if "$ICON_TOOL" --app "$CLAUDE_APP" $args --output "$res/applet.icns" \
       --assets-car "$res/Assets.car" >/dev/null 2>&1; then
       ICON_ARGS="$args"
-      [ -f "$res/Assets.car" ] && ICON_ASSET_NAME="AppIcon"
+      if [ -f "$res/Assets.car" ]; then
+        ICON_ASSET_NAME="AppIcon"
+      else
+        note_layered_icon_skipped
+      fi
       return 0
     fi
     rm -f "$res/Assets.car"

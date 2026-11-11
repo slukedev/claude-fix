@@ -210,15 +210,50 @@ func pngData(_ rep: NSBitmapImageRep) -> Data {
     return data
 }
 
-func run(_ tool: String, _ arguments: [String]) -> Bool {
+func run(_ tool: String, _ arguments: [String], environment: [String: String] = [:]) -> Bool {
     let task = Process()
     task.executableURL = URL(fileURLWithPath: tool)
     task.arguments = arguments
+    if !environment.isEmpty {
+        task.environment = ProcessInfo.processInfo.environment.merging(environment) { $1 }
+    }
     task.standardOutput = FileHandle.nullDevice
     task.standardError = FileHandle.nullDevice
     do { try task.run() } catch { return false }
     task.waitUntilExit()
     return task.terminationStatus == 0
+}
+
+func output(_ tool: String, _ arguments: [String]) -> String {
+    let task = Process()
+    let pipe = Pipe()
+    task.executableURL = URL(fileURLWithPath: tool)
+    task.arguments = arguments
+    task.standardOutput = pipe
+    task.standardError = FileHandle.nullDevice
+    do { try task.run() } catch { return "" }
+    let data = pipe.fileHandleForReading.readDataToEndOfFile()
+    task.waitUntilExit()
+    return String(data: data, encoding: .utf8) ?? ""
+}
+
+/// Ways to run actool, as environments for xcrun: the selected developer tools first, then
+/// every installed Xcode. Xcode is often installed while xcode-select still points at the
+/// Command Line Tools, which have no actool, and only Xcode 26 or later compiles .icon files.
+func actoolEnvironments() -> [[String: String]] {
+    var result: [[String: String]] = []
+    if run("/usr/bin/xcrun", ["--find", "actool"]) { result.append([:]) }
+    var apps = ["/Applications/Xcode.app", "/Applications/Xcode-beta.app"]
+    apps += output("/usr/bin/mdfind", ["kMDItemCFBundleIdentifier == 'com.apple.dt.Xcode'"])
+        .split(separator: "\n").map(String.init)
+    var seen = Set<String>()
+    for app in apps where seen.insert(app).inserted {
+        let developer = app + "/Contents/Developer"
+        if FileManager.default.isExecutableFile(atPath: developer + "/usr/bin/actool") {
+            result.append(["DEVELOPER_DIR": developer])
+        }
+    }
+    return result
 }
 
 let iconsetEntries: [(name: String, size: Int)] = [
@@ -589,7 +624,8 @@ func normalized(_ source: NSBitmapImageRep) -> NSBitmapImageRep {
 /// Writes a layered Icon Composer file and compiles it with actool. macOS 26 draws the
 /// Default, Dark, Clear and Tinted styles from the layers. Needs Xcode 26; returns false otherwise.
 func buildAssetsCar(foreground: NSBitmapImageRep, fill: RGB, output: URL) -> Bool {
-    guard run("/usr/bin/xcrun", ["--find", "actool"]) else { return false }
+    let environments = actoolEnvironments()
+    guard !environments.isEmpty else { return false }
     let work = temporaryDirectory()
     defer { try? FileManager.default.removeItem(at: work) }
     let bundle = work.appendingPathComponent("AppIcon.icon")
@@ -610,13 +646,16 @@ func buildAssetsCar(foreground: NSBitmapImageRep, fill: RGB, output: URL) -> Boo
     } catch {
         return false
     }
-    let ok = run("/usr/bin/xcrun", [
-        "actool", bundle.path, "--compile", compiled.path, "--platform", "macosx",
-        "--minimum-deployment-target", "11.0", "--app-icon", "AppIcon", "--include-all-app-icons",
-        "--output-partial-info-plist", work.appendingPathComponent("partial.plist").path,
-    ])
     let car = compiled.appendingPathComponent("Assets.car")
-    guard ok, FileManager.default.fileExists(atPath: car.path) else { return false }
+    // An older Xcode's actool can't read .icon files, so try each until one compiles it.
+    let built = environments.contains { environment in
+        run("/usr/bin/xcrun", [
+            "actool", bundle.path, "--compile", compiled.path, "--platform", "macosx",
+            "--minimum-deployment-target", "11.0", "--app-icon", "AppIcon", "--include-all-app-icons",
+            "--output-partial-info-plist", work.appendingPathComponent("partial.plist").path,
+        ], environment: environment) && FileManager.default.fileExists(atPath: car.path)
+    }
+    guard built else { return false }
     try? FileManager.default.removeItem(at: output)
     return (try? FileManager.default.copyItem(at: car, to: output)) != nil
 }
